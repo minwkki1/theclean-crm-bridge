@@ -1,7 +1,7 @@
 const sql = require("mssql");
 
 const ALLOW_ORIGINS = [
-  "https://ming709826297.imweb.me",
+  "https://your-imweb-domain.com",
   "https://www.your-imweb-domain.com"
 ];
 
@@ -19,6 +19,10 @@ function corsHeaders(origin) {
   return h;
 }
 
+function safeJsonParse(str) {
+  try { return JSON.parse(str); } catch { return null; }
+}
+
 exports.handler = async (event) => {
   const origin = pickOrigin(event.headers);
 
@@ -34,43 +38,69 @@ exports.handler = async (event) => {
     };
   }
 
-  try {
-    const config = {
-      user: process.env.MSSQL_USER,
-      password: process.env.MSSQL_PASSWORD,
-      server: process.env.MSSQL_HOST,
-      port: parseInt(process.env.MSSQL_PORT || "1433"),
-      database: process.env.MSSQL_DB,
-      options: {
-        encrypt: false,
-        trustServerCertificate: true
-      }
-    };
+  const raw = event.body || "";
+  const payload = safeJsonParse(raw) || {};
 
+  console.log("[collect] payload =", payload);
+
+  // 🔥 MSSQL 연결 설정
+  const config = {
+    user: process.env.MSSQL_USER,
+    password: process.env.MSSQL_PASSWORD,
+    server: process.env.MSSQL_HOST,
+    port: parseInt(process.env.MSSQL_PORT || "1433"),
+    database: process.env.MSSQL_DB,
+    options: {
+      encrypt: false,
+      trustServerCertificate: true
+    }
+  };
+
+  try {
     await sql.connect(config);
 
-    const payload = JSON.parse(event.body);
-
-    console.log("payload:", payload);
-
-    // 🔥 테스트용 INSERT
     await sql.query`
-      INSERT INTO TB_CLN_CUSTOMER_TEST (name, phone)
-      VALUES (${payload.name}, ${payload.phone})
+      INSERT INTO dbo.TB_CLN_CUSTOMER_test (
+        DB_STATUS,
+        CMPNY_CD,
+        REG_DT,
+        USE_YN,
+        AIRCON_WALL,
+        AIRCON_STAND,
+        AIRCON_2IN1,
+        AIRCON_1WAY,
+        AIRCON_4WAY,
+        REG_SOURCE
+      )
+      VALUES (
+        'NEW',
+        'TEST',
+        GETDATE(),
+        'Y',
+        'N',
+        'N',
+        'N',
+        'N',
+        'N',
+        'NETLIFY'
+      )
     `;
+
+    console.log("✅ INSERT SUCCESS");
 
     return {
       statusCode: 200,
       headers: corsHeaders(origin),
-      body: "OK"
+      body: JSON.stringify({ ok: true })
     };
 
   } catch (err) {
-    console.error("DB ERROR:", err);
+    console.error("❌ DB ERROR:", err);
+
     return {
       statusCode: 500,
       headers: corsHeaders(origin),
-      body: "DB ERROR"
+      body: JSON.stringify({ error: "DB insert failed" })
     };
   }
 };

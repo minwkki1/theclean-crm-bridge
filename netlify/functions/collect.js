@@ -39,7 +39,6 @@ function toYN(v, def = "N") {
 }
 
 function ynToKorYN(v) {
-  // FEED_BACK 표기용: Y/N만
   return (String(v || "N").toUpperCase() === "Y") ? "Y" : "N";
 }
 
@@ -57,6 +56,16 @@ function safeStr(v, maxLen = 4000) {
   const t = s.trim();
   if (!t) return "";
   return t.length > maxLen ? t.slice(0, maxLen) : t;
+}
+
+function extractMemoFromExtJson(extJsonStr) {
+  // ✅ 클라이언트가 EXT_ATTR_JSON 안에 { memo: "..." } 넣어 보내고 있음
+  const raw = safeStr(extJsonStr || "", 20000);
+  if (!raw) return "";
+  const obj = safeJsonParse(raw);
+  if (!obj || typeof obj !== "object") return "";
+  const memo = safeStr(obj.memo || "", 2000);
+  return memo;
 }
 
 exports.handler = async (event) => {
@@ -80,25 +89,26 @@ exports.handler = async (event) => {
   console.log("[collect] raw body =", raw);
   console.log("[collect] payload =", payload);
 
-  // 기대 스키마:
-  // { table, lock:{key,timeoutMs}, idempotencyKey, flat:{...} }
-  const table = payload.table || "TB_CLN_CUSTOMER_test";
+  // ✅ table은 외부 입력 받지 말고 고정 추천 (보안)
+  // const table = payload.table || "TB_CLN_CUSTOMER_test";
+  const table = "TB_CLN_CUSTOMER_test";
+
   const lockTimeoutMs = Number(payload?.lock?.timeoutMs || 8000);
   const idempotencyKey = safeStr(payload.idempotencyKey || "", 200);
   const flat = isPlainObject(payload.flat) ? payload.flat : {};
 
   // ✅ 고정 규칙 강제
-  const DB_STATUS = "0";          // 무조건 0
-  const REG_SOURCE = "홈페이지";  // 무조건 홈페이지
+  const DB_STATUS = "0";
+  const REG_SOURCE = "홈페이지";
   const CMPNY_CD = "TEST";
 
-  // ✅ 세션키(=DB_ADKEY): flat에서 우선 받고, 없으면 payload.sessionKey도 시도
+  // ✅ 세션키(=DB_ADKEY)
   const dbAdkey =
     safeStr(flat.DB_ADKEY || "", 120) ||
     safeStr(payload.sessionKey || "", 120) ||
-    ""; // 최종 문자열
+    ""; // 빈 문자열 가능
 
-  // 입력값(가능한 것만)
+  // 입력값
   const phone = safeStr(flat.DB_CMPNY_REG_PHONE || "", 100);
   const region = safeStr(flat.REGION || "", 200);
   const address = safeStr(flat.ADDRESS || region || "", 300);
@@ -106,10 +116,12 @@ exports.handler = async (event) => {
   // 날짜
   const reservationDate = toNullableDate(flat.RESERVATION_DATE);
 
-  // 동의/연락선호 (FEED_BACK 구성용)
+  // 동의/연락선호
   const consentRequired = ynToKorYN(toYN(flat.CONSENT_REQUIRED ?? flat.consentRequired, "N"));
   const consentMarketing = ynToKorYN(toYN(flat.CONSENT_MARKETING ?? flat.consentMarketing, "N"));
-  const consentMarketingReceive = ynToKorYN(toYN(flat.CONSENT_MARKETING_RECEIVE ?? flat.consentMarketingReceive, "N"));
+  const consentMarketingReceive = ynToKorYN(
+    toYN(flat.CONSENT_MARKETING_RECEIVE ?? flat.consentMarketingReceive, "N")
+  );
 
   const contactPrefRaw =
     safeStr(
@@ -120,13 +132,19 @@ exports.handler = async (event) => {
       50
     ) || "전화";
 
-  // ✅ FEED_BACK 포맷 강제
-  const feedback = `동의필수:${consentRequired} | 마케팅동의:${consentMarketing} | 마케팅수신:${consentMarketingReceive} | 연락선호:${contactPrefRaw}`;
-
   // ext json (그대로 저장)
   const extJson = safeStr(flat.EXT_ATTR_JSON || "", 20000);
 
-  // 에어컨 N 고정(요청)
+  // ✅ 메모는 EXT_ATTR_JSON.memo에서 추출해서 FEED_BACK 뒤에 붙임
+  const memo = extractMemoFromExtJson(extJson);
+  const memoPart = memo ? ` | 메모:${memo}` : ` | 메모:-`;
+
+  // ✅ FEED_BACK 포맷 강제 + 메모 포함
+  const feedback =
+    `동의필수:${consentRequired} | 마케팅동의:${consentMarketing} | 마케팅수신:${consentMarketingReceive} | 연락선호:${contactPrefRaw}` +
+    memoPart;
+
+  // 에어컨 N 고정
   const airconWall = "N";
   const airconStand = "N";
   const aircon2in1 = "N";
@@ -150,17 +168,16 @@ exports.handler = async (event) => {
   try {
     pool = await sql.connect(config);
 
-    // ✅ 비관적 락 키 전략:
-    // - DB_ADKEY가 있으면 "테이블+세션키" 기준으로 락 (같은 세션 동시요청 충돌 방지)
-    // - 없으면 요청별 랜덤 락 (동시 신규 insert 정도만 보호)
-    const lockKey =
-      (dbAdkey ? `${table}:DB_ADKEY:${dbAdkey}` : `${table}:NO_ADKEY:${Date.now()}`);
+    // ✅ 비관적 락 키: 같은 DB_ADKEY는 같은 락을 잡아 동시 업서트 충돌 방지
+    const lockKey = dbAdkey
+      ? `${table}:DB_ADKEY:${dbAdkey}`
+      : `${table}:NO_ADKEY:${Date.now()}`;
 
     const tx = new sql.Transaction(pool);
     await tx.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
 
     try {
-      // 1) 비관적 락(앱락)
+      // 1) app lock
       const lockReq = new sql.Request(tx);
       lockReq.input("Resource", sql.NVarChar(255), lockKey);
       lockReq.input("LockMode", sql.NVarChar(32), "Exclusive");
@@ -189,8 +206,7 @@ exports.handler = async (event) => {
         };
       }
 
-      // 2) (옵션) idempotency 체크: 기존 로직 유지
-      //    단, 지금은 “DB_ADKEY 업서트”가 핵심이라 idem은 참고용으로만 둠
+      // 2) (옵션) idempotency 체크 - 그대로 유지
       if (idempotencyKey) {
         const idemReq = new sql.Request(tx);
         const pattern = `%\"idempotencyKey\":\"${idempotencyKey.replace(/"/g, '\\"')}\"%`;
@@ -210,17 +226,14 @@ exports.handler = async (event) => {
           return {
             statusCode: 200,
             headers: corsHeaders(origin),
-            body: JSON.stringify({ ok: true, dup: true, seq: existedSeq }),
+            body: JSON.stringify({ ok: true, dup: true, seq: existedSeq, action: "IDEMPOTENCY" }),
           };
         }
       }
 
-      // 3) 업서트(덮어쓰기) by DB_ADKEY
-      //    - DB_ADKEY 있으면: UPDATE 먼저 시도 -> @@ROWCOUNT=0이면 INSERT
-      //    - DB_ADKEY 없으면: 무조건 INSERT (매칭 불가)
+      // 3) UPSERT by DB_ADKEY
       const req = new sql.Request(tx);
 
-      // inputs
       req.input("DB_STATUS", sql.VarChar(20), DB_STATUS);
       req.input("CMPNY_CD", sql.VarChar(20), CMPNY_CD);
       req.input("USE_YN", sql.VarChar(1), useYn);
@@ -259,12 +272,11 @@ exports.handler = async (event) => {
       const upsertSql = `
         DECLARE @out TABLE (SEQ INT, ACTION NVARCHAR(10));
 
-        -- ✅ DB_ADKEY가 있으면 "같은 키" UPDATE 우선 (비관적 락: UPDLOCK+HOLDLOCK)
         IF (@DB_ADKEY IS NOT NULL AND LTRIM(RTRIM(@DB_ADKEY)) <> '')
         BEGIN
           UPDATE T
           SET
-            T.DB_STATUS = @DB_STATUS,               -- 규칙 강제
+            T.DB_STATUS = @DB_STATUS,
             T.CMPNY_CD = @CMPNY_CD,
             T.USE_YN = @USE_YN,
 
@@ -282,7 +294,7 @@ exports.handler = async (event) => {
             T.AIRCON_1WAY = @AIRCON_1WAY,
             T.AIRCON_4WAY = @AIRCON_4WAY,
 
-            T.REG_SOURCE = @REG_SOURCE,            -- 규칙 강제
+            T.REG_SOURCE = @REG_SOURCE,
             T.UPD_DT = GETDATE()
           OUTPUT INSERTED.SEQ, 'UPDATE' INTO @out(SEQ, ACTION)
           FROM dbo.TB_CLN_CUSTOMER_test T WITH (UPDLOCK, HOLDLOCK)
@@ -291,106 +303,41 @@ exports.handler = async (event) => {
           IF (@@ROWCOUNT = 0)
           BEGIN
             INSERT INTO dbo.TB_CLN_CUSTOMER_test (
-              DB_STATUS,
-              CMPNY_CD,
-              REG_DT,
-              USE_YN,
-
+              DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
               DB_ADKEY,
-
-              DB_CMPNY_REG_PHONE,
-              REGION,
-              ADDRESS,
-              RESERVATION_DATE,
-
-              FEED_BACK,
-              EXT_ATTR_JSON,
-
-              AIRCON_WALL,
-              AIRCON_STAND,
-              AIRCON_2IN1,
-              AIRCON_1WAY,
-              AIRCON_4WAY,
-
+              DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
+              FEED_BACK, EXT_ATTR_JSON,
+              AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
               REG_SOURCE
             )
             OUTPUT INSERTED.SEQ, 'INSERT' INTO @out(SEQ, ACTION)
             VALUES (
-              @DB_STATUS,
-              @CMPNY_CD,
-              GETDATE(),
-              @USE_YN,
-
+              @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
               @DB_ADKEY,
-
-              @DB_CMPNY_REG_PHONE,
-              @REGION,
-              @ADDRESS,
-              @RESERVATION_DATE,
-
-              @FEED_BACK,
-              @EXT_ATTR_JSON,
-
-              @AIRCON_WALL,
-              @AIRCON_STAND,
-              @AIRCON_2IN1,
-              @AIRCON_1WAY,
-              @AIRCON_4WAY,
-
+              @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
+              @FEED_BACK, @EXT_ATTR_JSON,
+              @AIRCON_WALL, @AIRCON_STAND, @AIRCON_2IN1, @AIRCON_1WAY, @AIRCON_4WAY,
               @REG_SOURCE
             );
           END
         END
         ELSE
         BEGIN
-          -- ✅ DB_ADKEY가 NULL/빈값이면 매칭 불가: 무조건 신규 INSERT
           INSERT INTO dbo.TB_CLN_CUSTOMER_test (
-            DB_STATUS,
-            CMPNY_CD,
-            REG_DT,
-            USE_YN,
-
+            DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
             DB_ADKEY,
-
-            DB_CMPNY_REG_PHONE,
-            REGION,
-            ADDRESS,
-            RESERVATION_DATE,
-
-            FEED_BACK,
-            EXT_ATTR_JSON,
-
-            AIRCON_WALL,
-            AIRCON_STAND,
-            AIRCON_2IN1,
-            AIRCON_1WAY,
-            AIRCON_4WAY,
-
+            DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
+            FEED_BACK, EXT_ATTR_JSON,
+            AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
             REG_SOURCE
           )
           OUTPUT INSERTED.SEQ, 'INSERT' INTO @out(SEQ, ACTION)
           VALUES (
-            @DB_STATUS,
-            @CMPNY_CD,
-            GETDATE(),
-            @USE_YN,
-
+            @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
             NULL,
-
-            @DB_CMPNY_REG_PHONE,
-            @REGION,
-            @ADDRESS,
-            @RESERVATION_DATE,
-
-            @FEED_BACK,
-            @EXT_ATTR_JSON,
-
-            @AIRCON_WALL,
-            @AIRCON_STAND,
-            @AIRCON_2IN1,
-            @AIRCON_1WAY,
-            @AIRCON_4WAY,
-
+            @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
+            @FEED_BACK, @EXT_ATTR_JSON,
+            @AIRCON_WALL, @AIRCON_STAND, @AIRCON_2IN1, @AIRCON_1WAY, @AIRCON_4WAY,
             @REG_SOURCE
           );
         END

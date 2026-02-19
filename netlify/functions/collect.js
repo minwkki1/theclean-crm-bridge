@@ -2,7 +2,7 @@ const sql = require("mssql");
 
 const ALLOW_ORIGINS = [
   "https://your-imweb-domain.com",
-  "https://www.your-imweb-domain.com"
+  "https://ming709826297.imweb.me"
 ];
 
 function pickOrigin(headers) {

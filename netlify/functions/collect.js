@@ -157,7 +157,7 @@ exports.handler = async (event) => {
   console.log("[collect-v2.3] payload keys =", Object.keys(payload || {}));
 
   // ✅ table 외부 입력 금지
-  const table = "TB_CLN_CUSTOMER_test";
+  const table = "TB_CLN_CUSTOMER";
 
   const flat = isPlainObject(payload.flat) ? payload.flat : {};
 
@@ -270,7 +270,7 @@ exports.handler = async (event) => {
         SELECT TOP 1
           SEQ,
           REG_DT
-        FROM dbo.TB_CLN_CUSTOMER_test WITH (READPAST)
+        FROM dbo.TB_CLN_CUSTOMER WITH (READPAST)
         WHERE DB_CMPNY_REG_PHONE = @PHONE
           AND REG_DT >= DATEADD(HOUR, -24, GETDATE())
         ORDER BY REG_DT DESC;
@@ -359,7 +359,7 @@ exports.handler = async (event) => {
       });
 
       const insertSql = `
-        INSERT INTO dbo.TB_CLN_CUSTOMER_test (
+        INSERT INTO dbo.TB_CLN_CUSTOMER (
           DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
           DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
           FEED_BACK, EXT_ATTR_JSON,

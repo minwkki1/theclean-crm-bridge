@@ -1,13 +1,15 @@
 const sql = require("mssql");
 
 /* =========================================================
-  TCXM / TheCleanAtHome - Collect (MSSQL)
+  TCXM / TheCleanAtHome - Collect (MSSQL)  [A안 v2.3 FULL]
   ✅ DB_ADKEY 완전 제거 (읽기/쓰기 X)
   ✅ 전화번호(DB_CMPNY_REG_PHONE) 기준
-  ✅ 서버 메모리(인스턴스 내) 짧은 락으로 연타/중복 클릭 방지
+  ✅ 서버 메모리(인스턴스 내) "짧은 락"으로 연타/중복 클릭 방지
+     - 짧은 락에 걸리면: DUP 체크/모달 트리거 금지 → LOCKED_SHORT 응답
   ✅ 24시간 중복이면 최근 REG_DT 반환 + force=true 일 때만 신규 INSERT
   ✅ CMPNY_CD = "9000011" 하드코딩
   ✅ EXT_ATTR_JSON = NULL 고정
+  ✅ console.log 상세 출력
 ========================================================= */
 
 const ALLOW_ORIGINS = [
@@ -68,9 +70,28 @@ function safeStr(v, maxLen = 4000) {
   return t.length > maxLen ? t.slice(0, maxLen) : t;
 }
 
-function escapeForLog(v, maxLen = 500) {
+function escapeForLog(v, maxLen = 800) {
   const s = safeStr(v, maxLen);
   return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+}
+
+function fmtKst(dt) {
+  // DB에서 넘어오는 Date(UTC로 찍힐 수 있음)를 "KST 표기" 문자열로 반환
+  try {
+    const d = (dt instanceof Date) ? dt : new Date(dt);
+    if (Number.isNaN(d.getTime())) return null;
+    // KST = UTC+9 (간단 표기)
+    const k = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+    const yyyy = k.getUTCFullYear();
+    const mm = String(k.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(k.getUTCDate()).padStart(2, "0");
+    const hh = String(k.getUTCHours()).padStart(2, "0");
+    const mi = String(k.getUTCMinutes()).padStart(2, "0");
+    const ss = String(k.getUTCSeconds()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} (KST)`;
+  } catch {
+    return null;
+  }
 }
 
 /* =========================================================
@@ -132,8 +153,8 @@ exports.handler = async (event) => {
   const raw = event.body || "";
   const payload = safeJsonParse(raw) || {};
 
-  console.log("[collect-v2] raw body =", escapeForLog(raw, 1500));
-  console.log("[collect-v2] payload keys =", Object.keys(payload || {}));
+  console.log("[collect-v2.3] raw body =", escapeForLog(raw, 1600));
+  console.log("[collect-v2.3] payload keys =", Object.keys(payload || {}));
 
   // ✅ table 외부 입력 금지
   const table = "TB_CLN_CUSTOMER_test";
@@ -143,7 +164,7 @@ exports.handler = async (event) => {
   // ✅ 고정 규칙 강제
   const DB_STATUS = "0";
   const REG_SOURCE = "홈페이지";
-  const CMPNY_CD = "9000011"; // ✅ 하드코딩
+  const CMPNY_CD = "9000011"; // ✅ 하드코딩 (서버가 넣음)
 
   // ✅ force: 중복(24h)일 때 새로 접수 버튼 누르면 true로 재호출
   const force = !!(payload.force ?? flat.force);
@@ -152,7 +173,7 @@ exports.handler = async (event) => {
   const shortLockTtlMs = Number(payload?.lock?.shortTtlMs || 2500);
 
   // 입력값
-  const phone = safeStr(flat.DB_CMPNY_REG_PHONE || "", 100); // 이미 '-' 포함 포맷이라고 했으니 그대로
+  const phone = safeStr(flat.DB_CMPNY_REG_PHONE || "", 100); // '-' 포함 포맷 유지
   const region = safeStr(flat.REGION || "", 200);
   const address = safeStr(flat.ADDRESS || region || "", 300);
   const reservationDate = toNullableDate(flat.RESERVATION_DATE);
@@ -173,13 +194,14 @@ exports.handler = async (event) => {
       50
     ) || "전화";
 
-  // ✅ EXT_ATTR_JSON은 만들지도/저장하지도 않음
+  // ✅ EXT_ATTR_JSON은 만들지도/저장하지도 않음 → NULL 고정
   const extJson = null;
 
-  // ✅ memo는 flat.MEMO로 받거나(원하면), 일단 기존처럼 받지 않는 방향
+  // ✅ 메모는 "선택" (EXT_ATTR_JSON 만들지 않으니, 필요하면 flat.MEMO로만 받는다)
   const memo = safeStr(flat.MEMO || flat.memo || "", 2000);
   const memoPart = memo ? ` | 메모:${memo}` : ` | 메모:-`;
 
+  // ✅ FEED_BACK 포맷 강제
   const feedback =
     `동의필수:${consentRequired} | 마케팅동의:${consentMarketing} | 마케팅수신:${consentMarketingReceive} | 연락선호:${contactPrefRaw}` +
     memoPart;
@@ -193,9 +215,9 @@ exports.handler = async (event) => {
 
   const useYn = toYN(flat.USE_YN, "Y");
 
-  // ✅ 필수값 체크 (필요 최소)
+  // ✅ 필수값 체크 (최소)
   if (!phone) {
-    console.log("[collect-v2] ❌ missing phone");
+    console.log("[collect-v2.3] ❌ missing phone");
     return {
       statusCode: 400,
       headers: corsHeaders(origin),
@@ -205,13 +227,14 @@ exports.handler = async (event) => {
 
   // =========================================================
   // ✅ (A안) 짧은락: 같은 전화번호로 들어오는 "연타" 요청은 여기서 컷
-  // - 이때는 "중복(24h)" 안내 모달 띄우면 안되므로 locked_short로 응답
+  // - 이때는 "중복(24h)" 안내 모달을 띄우면 안되므로
+  //   DUP 체크 전에 바로 LOCKED_SHORT로 반환한다.
   // =========================================================
   const lockKey = `${table}:PHONE:${phone}`;
   const lock = acquireShortLock(lockKey, shortLockTtlMs);
 
   if (!lock.ok) {
-    console.log("[collect-v2] ⛔ locked_short", { phone, remainMs: lock.remainMs });
+    console.log("[collect-v2.3] ⛔ locked_short", { phone, remainMs: lock.remainMs });
     return {
       statusCode: 200,
       headers: corsHeaders(origin),
@@ -229,18 +252,21 @@ exports.handler = async (event) => {
   try {
     pool = await sql.connect(mssqlConfig());
 
-    // ✅ 트랜잭션: 24h 체크 + (조건부) insert 를 한 덩어리로
+    // ✅ 트랜잭션: 24h 체크 + (조건부) INSERT 를 한 덩어리로
     const tx = new sql.Transaction(pool);
     await tx.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
 
     try {
       // ---------------------------------------------------------
       // 1) 24시간 중복 체크 (REG_DT 기준)
+      //    - 여기서는 락이 이미 잡혀있으므로 "연타에 의한 2중 실행"은 방지됨
+      //    - 하지만 (서로 다른 인스턴스) 동시 요청 가능성은 남는다.
+      //      → 그래도 요구사항(A안)대로 DB PK 변경 없이 진행.
       // ---------------------------------------------------------
       const dupReq = new sql.Request(tx);
       dupReq.input("PHONE", sql.NVarChar(100), phone);
 
-      const dupResult = await dupReq.query(`
+      const dupSql = `
         SELECT TOP 1
           SEQ,
           REG_DT
@@ -248,23 +274,28 @@ exports.handler = async (event) => {
         WHERE DB_CMPNY_REG_PHONE = @PHONE
           AND REG_DT >= DATEADD(HOUR, -24, GETDATE())
         ORDER BY REG_DT DESC;
-      `);
+      `;
 
+      const dupResult = await dupReq.query(dupSql);
       const dupRow = dupResult?.recordset?.[0] || null;
       const isDup24h = !!dupRow;
 
-      console.log("[collect-v2] dup-check", {
+      console.log("[collect-v2.3] dup-check", {
         phone,
         isDup24h,
         latestSeq: dupRow?.SEQ,
         latestRegDt: dupRow?.REG_DT,
+        latestRegDtKst: dupRow?.REG_DT ? fmtKst(dupRow.REG_DT) : null,
         force,
       });
 
-      // 중복인데 force=false면 저장 금지 + 최근 신청시간 반환
+      // ✅ 중복인데 force=false면 저장 금지 + 최근 신청시간 반환
       if (isDup24h && !force) {
         await tx.commit();
-        releaseLock(lockKey); // ✅ 빠르게 락 해제 (중복 모달 띄우는 건 프론트에서)
+
+        // ✅ 여기서 락 해제:
+        // - 프론트가 모달 띄우고 "새로 접수" 누르면 force=true로 재호출할 것
+        releaseLock(lockKey);
 
         return {
           statusCode: 200,
@@ -275,7 +306,8 @@ exports.handler = async (event) => {
             phone,
             latest: {
               seq: dupRow.SEQ,
-              regDt: dupRow.REG_DT, // 프론트에서 표시
+              regDt: dupRow.REG_DT,
+              regDtKst: dupRow.REG_DT ? fmtKst(dupRow.REG_DT) : null,
             },
             message: "24시간 이내 동일 전화번호 접수가 있습니다.",
           }),
@@ -312,15 +344,17 @@ exports.handler = async (event) => {
       if (reservationDate) insReq.input("RESERVATION_DATE", sql.DateTime, reservationDate);
       else insReq.input("RESERVATION_DATE", sql.DateTime, null);
 
-      console.log("[collect-v2] insert mapped =", {
+      console.log("[collect-v2.3] insert mapped =", {
         table,
+        DB_STATUS,
         CMPNY_CD,
+        REG_SOURCE,
         phone,
         region,
         address,
         reservationDate: reservationDate ? reservationDate.toISOString() : null,
         FEED_BACK: feedback,
-        EXT_ATTR_JSON: null,
+        EXT_ATTR_JSON: extJson,
         force,
       });
 
@@ -332,7 +366,7 @@ exports.handler = async (event) => {
           AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
           REG_SOURCE
         )
-        OUTPUT INSERTED.SEQ AS SEQ
+        OUTPUT INSERTED.SEQ AS SEQ, INSERTED.REG_DT AS REG_DT
         VALUES (
           @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
           @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
@@ -344,10 +378,17 @@ exports.handler = async (event) => {
 
       const insRes = await insReq.query(insertSql);
       const seq = insRes?.recordset?.[0]?.SEQ;
+      const regDt = insRes?.recordset?.[0]?.REG_DT;
 
       await tx.commit();
 
-      console.log("[collect-v2] ✅ INSERT SUCCESS", { seq, phone, force });
+      console.log("[collect-v2.3] ✅ INSERT SUCCESS", {
+        seq,
+        phone,
+        force,
+        regDt,
+        regDtKst: regDt ? fmtKst(regDt) : null,
+      });
 
       return {
         statusCode: 200,
@@ -358,11 +399,13 @@ exports.handler = async (event) => {
           seq,
           phone,
           force,
+          regDt,
+          regDtKst: regDt ? fmtKst(regDt) : null,
         }),
       };
 
     } catch (e) {
-      console.error("[collect-v2] ❌ TX ERROR:", e);
+      console.error("[collect-v2.3] ❌ TX ERROR:", e);
       try { await tx.rollback(); } catch {}
       return {
         statusCode: 500,
@@ -375,7 +418,7 @@ exports.handler = async (event) => {
     }
 
   } catch (err) {
-    console.error("[collect-v2] ❌ DB ERROR:", err);
+    console.error("[collect-v2.3] ❌ DB ERROR:", err);
     // ✅ DB 연결 실패시도 락 해제
     releaseLock(lockKey);
     return {

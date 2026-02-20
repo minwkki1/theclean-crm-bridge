@@ -1,5 +1,15 @@
 const sql = require("mssql");
 
+/* =========================================================
+  TCXM / TheCleanAtHome - Collect (MSSQL)
+  ✅ DB_ADKEY 완전 제거 (읽기/쓰기 X)
+  ✅ 전화번호(DB_CMPNY_REG_PHONE) 기준
+  ✅ 서버 메모리(인스턴스 내) 짧은 락으로 연타/중복 클릭 방지
+  ✅ 24시간 중복이면 최근 REG_DT 반환 + force=true 일 때만 신규 INSERT
+  ✅ CMPNY_CD = "9000011" 하드코딩
+  ✅ EXT_ATTR_JSON = NULL 고정
+========================================================= */
+
 const ALLOW_ORIGINS = [
   "https://theclean-crm-bridge.netlify.app",
   "https://ming709826297.imweb.me",
@@ -58,14 +68,50 @@ function safeStr(v, maxLen = 4000) {
   return t.length > maxLen ? t.slice(0, maxLen) : t;
 }
 
-function extractMemoFromExtJson(extJsonStr) {
-  // ✅ 클라이언트가 EXT_ATTR_JSON 안에 { memo: "..." } 넣어 보내고 있음
-  const raw = safeStr(extJsonStr || "", 20000);
-  if (!raw) return "";
-  const obj = safeJsonParse(raw);
-  if (!obj || typeof obj !== "object") return "";
-  const memo = safeStr(obj.memo || "", 2000);
-  return memo;
+function escapeForLog(v, maxLen = 500) {
+  const s = safeStr(v, maxLen);
+  return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+}
+
+/* =========================================================
+  ✅ 서버 메모리 락 (A안)
+  - 같은 인스턴스 안에서만 보장
+  - 목적: "연타 클릭"으로 동일 요청이 거의 동시에 2번 들어오는 것 방지
+========================================================= */
+const __TCXM_LOCK_MAP__ = global.__TCXM_LOCK_MAP__ || new Map();
+global.__TCXM_LOCK_MAP__ = __TCXM_LOCK_MAP__;
+
+function nowMs() { return Date.now(); }
+
+function acquireShortLock(key, ttlMs) {
+  const now = nowMs();
+  const exp = __TCXM_LOCK_MAP__.get(key);
+
+  if (exp && exp > now) {
+    return { ok: false, remainMs: exp - now };
+  }
+
+  __TCXM_LOCK_MAP__.set(key, now + ttlMs);
+  return { ok: true, remainMs: ttlMs };
+}
+
+function releaseLock(key) {
+  __TCXM_LOCK_MAP__.delete(key);
+}
+
+/* =========================================================
+  ✅ MSSQL 연결 설정
+========================================================= */
+function mssqlConfig() {
+  return {
+    user: process.env.MSSQL_USER,
+    password: process.env.MSSQL_PASSWORD,
+    server: process.env.MSSQL_HOST,
+    port: parseInt(process.env.MSSQL_PORT || "1433", 10),
+    database: process.env.MSSQL_DB,
+    options: { encrypt: false, trustServerCertificate: true },
+    pool: { max: 5, min: 0, idleTimeoutMillis: 30000 },
+  };
 }
 
 exports.handler = async (event) => {
@@ -86,34 +132,29 @@ exports.handler = async (event) => {
   const raw = event.body || "";
   const payload = safeJsonParse(raw) || {};
 
-  console.log("[collect] raw body =", raw);
-  console.log("[collect] payload =", payload);
+  console.log("[collect-v2] raw body =", escapeForLog(raw, 1500));
+  console.log("[collect-v2] payload keys =", Object.keys(payload || {}));
 
-  // ✅ table은 외부 입력 받지 말고 고정 추천 (보안)
-  // const table = payload.table || "TB_CLN_CUSTOMER_test";
+  // ✅ table 외부 입력 금지
   const table = "TB_CLN_CUSTOMER_test";
 
-  const lockTimeoutMs = Number(payload?.lock?.timeoutMs || 8000);
-  const idempotencyKey = safeStr(payload.idempotencyKey || "", 200);
   const flat = isPlainObject(payload.flat) ? payload.flat : {};
 
   // ✅ 고정 규칙 강제
   const DB_STATUS = "0";
   const REG_SOURCE = "홈페이지";
-  const CMPNY_CD = "TEST";
+  const CMPNY_CD = "9000011"; // ✅ 하드코딩
 
-  // ✅ 세션키(=DB_ADKEY)
-  const dbAdkey =
-    safeStr(flat.DB_ADKEY || "", 120) ||
-    safeStr(payload.sessionKey || "", 120) ||
-    ""; // 빈 문자열 가능
+  // ✅ force: 중복(24h)일 때 새로 접수 버튼 누르면 true로 재호출
+  const force = !!(payload.force ?? flat.force);
+
+  // ✅ 짧은락 TTL (연타 방지). 기본 2500ms 추천
+  const shortLockTtlMs = Number(payload?.lock?.shortTtlMs || 2500);
 
   // 입력값
-  const phone = safeStr(flat.DB_CMPNY_REG_PHONE || "", 100);
+  const phone = safeStr(flat.DB_CMPNY_REG_PHONE || "", 100); // 이미 '-' 포함 포맷이라고 했으니 그대로
   const region = safeStr(flat.REGION || "", 200);
   const address = safeStr(flat.ADDRESS || region || "", 300);
-
-  // 날짜
   const reservationDate = toNullableDate(flat.RESERVATION_DATE);
 
   // 동의/연락선호
@@ -132,14 +173,13 @@ exports.handler = async (event) => {
       50
     ) || "전화";
 
-  // ext json (그대로 저장)
-  const extJson = safeStr(flat.EXT_ATTR_JSON || "", 20000);
+  // ✅ EXT_ATTR_JSON은 만들지도/저장하지도 않음
+  const extJson = null;
 
-  // ✅ 메모는 EXT_ATTR_JSON.memo에서 추출해서 FEED_BACK 뒤에 붙임
-  const memo = extractMemoFromExtJson(extJson);
+  // ✅ memo는 flat.MEMO로 받거나(원하면), 일단 기존처럼 받지 않는 방향
+  const memo = safeStr(flat.MEMO || flat.memo || "", 2000);
   const memoPart = memo ? ` | 메모:${memo}` : ` | 메모:-`;
 
-  // ✅ FEED_BACK 포맷 강제 + 메모 포함
   const feedback =
     `동의필수:${consentRequired} | 마케팅동의:${consentMarketing} | 마케팅수신:${consentMarketingReceive} | 연락선호:${contactPrefRaw}` +
     memoPart;
@@ -153,225 +193,191 @@ exports.handler = async (event) => {
 
   const useYn = toYN(flat.USE_YN, "Y");
 
-  // 🔥 MSSQL 연결 설정
-  const config = {
-    user: process.env.MSSQL_USER,
-    password: process.env.MSSQL_PASSWORD,
-    server: process.env.MSSQL_HOST,
-    port: parseInt(process.env.MSSQL_PORT || "1433", 10),
-    database: process.env.MSSQL_DB,
-    options: { encrypt: false, trustServerCertificate: true },
-    pool: { max: 5, min: 0, idleTimeoutMillis: 30000 },
-  };
+  // ✅ 필수값 체크 (필요 최소)
+  if (!phone) {
+    console.log("[collect-v2] ❌ missing phone");
+    return {
+      statusCode: 400,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({ ok: false, error: "MISSING_PHONE" }),
+    };
+  }
+
+  // =========================================================
+  // ✅ (A안) 짧은락: 같은 전화번호로 들어오는 "연타" 요청은 여기서 컷
+  // - 이때는 "중복(24h)" 안내 모달 띄우면 안되므로 locked_short로 응답
+  // =========================================================
+  const lockKey = `${table}:PHONE:${phone}`;
+  const lock = acquireShortLock(lockKey, shortLockTtlMs);
+
+  if (!lock.ok) {
+    console.log("[collect-v2] ⛔ locked_short", { phone, remainMs: lock.remainMs });
+    return {
+      statusCode: 200,
+      headers: corsHeaders(origin),
+      body: JSON.stringify({
+        ok: false,
+        status: "LOCKED_SHORT",
+        phone,
+        remainMs: lock.remainMs,
+        message: "요청 처리 중입니다. 잠시만 기다려주세요.",
+      }),
+    };
+  }
 
   let pool;
   try {
-    pool = await sql.connect(config);
+    pool = await sql.connect(mssqlConfig());
 
-    // ✅ 비관적 락 키: 같은 DB_ADKEY는 같은 락을 잡아 동시 업서트 충돌 방지
-    const lockKey = dbAdkey
-      ? `${table}:DB_ADKEY:${dbAdkey}`
-      : `${table}:NO_ADKEY:${Date.now()}`;
-
+    // ✅ 트랜잭션: 24h 체크 + (조건부) insert 를 한 덩어리로
     const tx = new sql.Transaction(pool);
-    await tx.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+    await tx.begin(sql.ISOLATION_LEVEL.READ_COMMITTED);
 
     try {
-      // 1) app lock
-      const lockReq = new sql.Request(tx);
-      lockReq.input("Resource", sql.NVarChar(255), lockKey);
-      lockReq.input("LockMode", sql.NVarChar(32), "Exclusive");
-      lockReq.input("LockOwner", sql.NVarChar(32), "Transaction");
-      lockReq.input("LockTimeout", sql.Int, lockTimeoutMs);
+      // ---------------------------------------------------------
+      // 1) 24시간 중복 체크 (REG_DT 기준)
+      // ---------------------------------------------------------
+      const dupReq = new sql.Request(tx);
+      dupReq.input("PHONE", sql.NVarChar(100), phone);
 
-      const lockResult = await lockReq.query(`
-        DECLARE @res INT;
-        EXEC @res = sp_getapplock
-          @Resource = @Resource,
-          @LockMode = @LockMode,
-          @LockOwner = @LockOwner,
-          @LockTimeout = @LockTimeout;
-        SELECT @res AS lockResult;
+      const dupResult = await dupReq.query(`
+        SELECT TOP 1
+          SEQ,
+          REG_DT
+        FROM dbo.TB_CLN_CUSTOMER_test WITH (READPAST)
+        WHERE DB_CMPNY_REG_PHONE = @PHONE
+          AND REG_DT >= DATEADD(HOUR, -24, GETDATE())
+        ORDER BY REG_DT DESC;
       `);
 
-      const lr = lockResult?.recordset?.[0]?.lockResult;
-      console.log("[collect] applock result =", lr, "lockKey=", lockKey);
+      const dupRow = dupResult?.recordset?.[0] || null;
+      const isDup24h = !!dupRow;
 
-      if (lr < 0) {
-        await tx.rollback();
+      console.log("[collect-v2] dup-check", {
+        phone,
+        isDup24h,
+        latestSeq: dupRow?.SEQ,
+        latestRegDt: dupRow?.REG_DT,
+        force,
+      });
+
+      // 중복인데 force=false면 저장 금지 + 최근 신청시간 반환
+      if (isDup24h && !force) {
+        await tx.commit();
+        releaseLock(lockKey); // ✅ 빠르게 락 해제 (중복 모달 띄우는 건 프론트에서)
+
         return {
-          statusCode: 423,
+          statusCode: 200,
           headers: corsHeaders(origin),
-          body: JSON.stringify({ ok: false, error: "LOCK_TIMEOUT", lockResult: lr }),
+          body: JSON.stringify({
+            ok: false,
+            status: "DUPLICATE_24H",
+            phone,
+            latest: {
+              seq: dupRow.SEQ,
+              regDt: dupRow.REG_DT, // 프론트에서 표시
+            },
+            message: "24시간 이내 동일 전화번호 접수가 있습니다.",
+          }),
         };
       }
 
-      // 2) (옵션) idempotency 체크 - 그대로 유지
-      if (idempotencyKey) {
-        const idemReq = new sql.Request(tx);
-        const pattern = `%\"idempotencyKey\":\"${idempotencyKey.replace(/"/g, '\\"')}\"%`;
-        idemReq.input("pattern", sql.NVarChar(4000), pattern);
+      // ---------------------------------------------------------
+      // 2) INSERT (항상 새 row)
+      //    - PK(SEQ)는 IDENTITY라 DB가 자동 생성
+      //    - CMPNY_CD = 9000011
+      //    - EXT_ATTR_JSON = NULL
+      // ---------------------------------------------------------
+      const insReq = new sql.Request(tx);
 
-        const exists = await idemReq.query(`
-          SELECT TOP 1 SEQ
-          FROM dbo.TB_CLN_CUSTOMER_test WITH (UPDLOCK, HOLDLOCK)
-          WHERE EXT_ATTR_JSON LIKE @pattern
-          ORDER BY SEQ DESC
-        `);
+      insReq.input("DB_STATUS", sql.VarChar(20), DB_STATUS);
+      insReq.input("CMPNY_CD", sql.VarChar(20), CMPNY_CD);
+      insReq.input("USE_YN", sql.VarChar(1), useYn);
 
-        const existedSeq = exists?.recordset?.[0]?.SEQ;
-        if (existedSeq) {
-          console.log("[collect] ✅ idempotency hit. existed SEQ =", existedSeq);
-          await tx.commit();
-          return {
-            statusCode: 200,
-            headers: corsHeaders(origin),
-            body: JSON.stringify({ ok: true, dup: true, seq: existedSeq, action: "IDEMPOTENCY" }),
-          };
-        }
-      }
+      insReq.input("DB_CMPNY_REG_PHONE", sql.NVarChar(100), phone || null);
+      insReq.input("REGION", sql.NVarChar(200), region || null);
+      insReq.input("ADDRESS", sql.NVarChar(300), address || null);
 
-      // 3) UPSERT by DB_ADKEY
-      const req = new sql.Request(tx);
+      insReq.input("FEED_BACK", sql.NVarChar(sql.MAX), feedback || null);
+      insReq.input("EXT_ATTR_JSON", sql.NVarChar(sql.MAX), null); // ✅ 항상 NULL
 
-      req.input("DB_STATUS", sql.VarChar(20), DB_STATUS);
-      req.input("CMPNY_CD", sql.VarChar(20), CMPNY_CD);
-      req.input("USE_YN", sql.VarChar(1), useYn);
+      insReq.input("AIRCON_WALL", sql.Char(1), airconWall);
+      insReq.input("AIRCON_STAND", sql.Char(1), airconStand);
+      insReq.input("AIRCON_2IN1", sql.Char(1), aircon2in1);
+      insReq.input("AIRCON_1WAY", sql.Char(1), aircon1way);
+      insReq.input("AIRCON_4WAY", sql.Char(1), aircon4way);
 
-      req.input("DB_ADKEY", sql.NVarChar(120), dbAdkey || null);
+      insReq.input("REG_SOURCE", sql.NVarChar(50), REG_SOURCE);
 
-      req.input("DB_CMPNY_REG_PHONE", sql.NVarChar(100), phone || null);
-      req.input("REGION", sql.NVarChar(200), region || null);
-      req.input("ADDRESS", sql.NVarChar(300), address || null);
-      req.input("FEED_BACK", sql.NVarChar(sql.MAX), feedback || null);
-      req.input("EXT_ATTR_JSON", sql.NVarChar(sql.MAX), extJson || null);
+      if (reservationDate) insReq.input("RESERVATION_DATE", sql.DateTime, reservationDate);
+      else insReq.input("RESERVATION_DATE", sql.DateTime, null);
 
-      req.input("AIRCON_WALL", sql.Char(1), airconWall);
-      req.input("AIRCON_STAND", sql.Char(1), airconStand);
-      req.input("AIRCON_2IN1", sql.Char(1), aircon2in1);
-      req.input("AIRCON_1WAY", sql.Char(1), aircon1way);
-      req.input("AIRCON_4WAY", sql.Char(1), aircon4way);
-
-      req.input("REG_SOURCE", sql.NVarChar(50), REG_SOURCE);
-
-      if (reservationDate) req.input("RESERVATION_DATE", sql.DateTime, reservationDate);
-      else req.input("RESERVATION_DATE", sql.DateTime, null);
-
-      console.log("[collect] mapped =", {
+      console.log("[collect-v2] insert mapped =", {
         table,
-        DB_STATUS,
-        REG_SOURCE,
-        dbAdkey: dbAdkey || null,
-        phone: phone || null,
-        region: region || null,
-        address: address || null,
+        CMPNY_CD,
+        phone,
+        region,
+        address,
         reservationDate: reservationDate ? reservationDate.toISOString() : null,
         FEED_BACK: feedback,
+        EXT_ATTR_JSON: null,
+        force,
       });
 
-      const upsertSql = `
-        DECLARE @out TABLE (SEQ INT, ACTION NVARCHAR(10));
-
-        IF (@DB_ADKEY IS NOT NULL AND LTRIM(RTRIM(@DB_ADKEY)) <> '')
-        BEGIN
-          UPDATE T
-          SET
-            T.DB_STATUS = @DB_STATUS,
-            T.CMPNY_CD = @CMPNY_CD,
-            T.USE_YN = @USE_YN,
-
-            T.DB_CMPNY_REG_PHONE = @DB_CMPNY_REG_PHONE,
-            T.REGION = @REGION,
-            T.ADDRESS = @ADDRESS,
-            T.RESERVATION_DATE = @RESERVATION_DATE,
-
-            T.FEED_BACK = @FEED_BACK,
-            T.EXT_ATTR_JSON = @EXT_ATTR_JSON,
-
-            T.AIRCON_WALL = @AIRCON_WALL,
-            T.AIRCON_STAND = @AIRCON_STAND,
-            T.AIRCON_2IN1 = @AIRCON_2IN1,
-            T.AIRCON_1WAY = @AIRCON_1WAY,
-            T.AIRCON_4WAY = @AIRCON_4WAY,
-
-            T.REG_SOURCE = @REG_SOURCE,
-            T.UPD_DT = GETDATE()
-          OUTPUT INSERTED.SEQ, 'UPDATE' INTO @out(SEQ, ACTION)
-          FROM dbo.TB_CLN_CUSTOMER_test T WITH (UPDLOCK, HOLDLOCK)
-          WHERE T.DB_ADKEY = @DB_ADKEY;
-
-          IF (@@ROWCOUNT = 0)
-          BEGIN
-            INSERT INTO dbo.TB_CLN_CUSTOMER_test (
-              DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
-              DB_ADKEY,
-              DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
-              FEED_BACK, EXT_ATTR_JSON,
-              AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
-              REG_SOURCE
-            )
-            OUTPUT INSERTED.SEQ, 'INSERT' INTO @out(SEQ, ACTION)
-            VALUES (
-              @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
-              @DB_ADKEY,
-              @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
-              @FEED_BACK, @EXT_ATTR_JSON,
-              @AIRCON_WALL, @AIRCON_STAND, @AIRCON_2IN1, @AIRCON_1WAY, @AIRCON_4WAY,
-              @REG_SOURCE
-            );
-          END
-        END
-        ELSE
-        BEGIN
-          INSERT INTO dbo.TB_CLN_CUSTOMER_test (
-            DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
-            DB_ADKEY,
-            DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
-            FEED_BACK, EXT_ATTR_JSON,
-            AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
-            REG_SOURCE
-          )
-          OUTPUT INSERTED.SEQ, 'INSERT' INTO @out(SEQ, ACTION)
-          VALUES (
-            @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
-            NULL,
-            @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
-            @FEED_BACK, @EXT_ATTR_JSON,
-            @AIRCON_WALL, @AIRCON_STAND, @AIRCON_2IN1, @AIRCON_1WAY, @AIRCON_4WAY,
-            @REG_SOURCE
-          );
-        END
-
-        SELECT TOP 1 SEQ, ACTION FROM @out;
+      const insertSql = `
+        INSERT INTO dbo.TB_CLN_CUSTOMER_test (
+          DB_STATUS, CMPNY_CD, REG_DT, USE_YN,
+          DB_CMPNY_REG_PHONE, REGION, ADDRESS, RESERVATION_DATE,
+          FEED_BACK, EXT_ATTR_JSON,
+          AIRCON_WALL, AIRCON_STAND, AIRCON_2IN1, AIRCON_1WAY, AIRCON_4WAY,
+          REG_SOURCE
+        )
+        OUTPUT INSERTED.SEQ AS SEQ
+        VALUES (
+          @DB_STATUS, @CMPNY_CD, GETDATE(), @USE_YN,
+          @DB_CMPNY_REG_PHONE, @REGION, @ADDRESS, @RESERVATION_DATE,
+          @FEED_BACK, NULL,
+          @AIRCON_WALL, @AIRCON_STAND, @AIRCON_2IN1, @AIRCON_1WAY, @AIRCON_4WAY,
+          @REG_SOURCE
+        );
       `;
 
-      const result = await req.query(upsertSql);
-      const row = result?.recordset?.[0] || {};
-      const seq = row.SEQ;
-      const action = row.ACTION || "UNKNOWN";
-
-      console.log("[collect] ✅ UPSERT SUCCESS", { seq, action, dbAdkey: dbAdkey || null });
+      const insRes = await insReq.query(insertSql);
+      const seq = insRes?.recordset?.[0]?.SEQ;
 
       await tx.commit();
+
+      console.log("[collect-v2] ✅ INSERT SUCCESS", { seq, phone, force });
 
       return {
         statusCode: 200,
         headers: corsHeaders(origin),
-        body: JSON.stringify({ ok: true, seq, action }),
+        body: JSON.stringify({
+          ok: true,
+          status: "INSERTED",
+          seq,
+          phone,
+          force,
+        }),
       };
 
     } catch (e) {
-      console.error("[collect] ❌ TX ERROR:", e);
+      console.error("[collect-v2] ❌ TX ERROR:", e);
       try { await tx.rollback(); } catch {}
       return {
         statusCode: 500,
         headers: corsHeaders(origin),
         body: JSON.stringify({ ok: false, error: "TX_FAILED" }),
       };
+    } finally {
+      // ✅ TX 끝나면 락 해제
+      releaseLock(lockKey);
     }
 
   } catch (err) {
-    console.error("[collect] ❌ DB ERROR:", err);
+    console.error("[collect-v2] ❌ DB ERROR:", err);
+    // ✅ DB 연결 실패시도 락 해제
+    releaseLock(lockKey);
     return {
       statusCode: 500,
       headers: corsHeaders(origin),

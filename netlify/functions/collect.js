@@ -17,7 +17,8 @@ const ALLOW_ORIGINS = [
   "https://ming709826297.imweb.me",
   "https://xn--9m1bq4jd2k55kh7g.kr",
   "https://www.xn--9m1bq4jd2k55kh7g.kr",
-  "https://thecleanathome.co.kr",  
+  "https://thecleanathome.co.kr",
+  "https://www.thecleanathome.co.kr"
 ];
 
 function pickOrigin(headers) {
